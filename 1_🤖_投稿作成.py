@@ -1,200 +1,349 @@
+import requests
+import json
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import requests
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import pinecone
+from pinecone import Pinecone
+from sentence_transformers import SentenceTransformer
+from PyPDF2 import PdfReader
+import langchain
+from openai import OpenAI
 import streamlit as st
-import scraping_helper as sh
+from example_plot import example_plot
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain.callbacks import tracing_v2_enabled
 
-st.set_page_config(
-    page_icon='🤖',
-    layout='wide',
-)
+apify_wcc_endpoint = st.secrets['website_content_crawler_endpoint']
+apifyapi_key = st.secrets['apifyapi_key']
+pinecone_api_key = st.secrets['PINECONE_API_KEY']
+pinecone_index_name = st.secrets['PINECONE_INDEX_NAME']
+openai_api_key = st.secrets['OPENAI_API_KEY']
 
-st.title('SAKIYOMI 投稿作成AI')
 
-st.sidebar.title('メニュー')
+# URLからコンテンツをスクレイピングする関数
+def scrape_url(url):
+    try:
+        print(f"scrape_url: URL = {url}")  # デバッグ用プリント
+        headers = {"Authorization": f"Bearer {apifyapi_key}"}
+        payload = {"startUrls": [{"url": url}]}
+        response = requests.post(apify_wcc_endpoint, json=payload, headers=headers)
 
-# タブセット1: "Input / Generated Script" を含むタブ
-tab1, tab2 = st.tabs(["プロット生成", "データ登録"])
+        # print(f"scrape_url: Response = {response.text[:100]}...")  # デバッグ用プリント（応答の最初の100文字を表示）
+        if response.status_code in [200, 201]:
+            return response.text
+        else:
+            raise Exception(f"ステータスコード: {response.status_code}, レスポンス: {response.text}")
+    except Exception as e:
+        raise Exception(f"scrape_urlでエラーが発生しました: {e}")
 
-with tab1:
-    col1, col2 = st.columns(2)
 
-    with col1:
-        user_input = st.text_area("生成指示 : 作りたいプロットのイメージを入力", value="""以下の内容で台本を書いてください。\nテーマ：\n\nターゲット：\n\nその他の指示：""", height=300)
-        url = st.text_input("参考URL")
-        submit_button = st.button('送信')
+    
+# データ内の必要なキーだけを取得する関数
+def extract_keys_from_json(json_data):
+    data = json.loads(json_data)
+    extracted_data = []
+    for item in data:
+        formatted_data = {
+            'url': item.get('url', ''),
+            'description': item.get('metadata', {}).get('description', ''),
+            'title': item.get('metadata', {}).get('title', ''),
+            'text': item.get('text', ''),
+            'keywords': item.get('metadata', {}).get('keywords', '')
+        }
+        extracted_data.append(formatted_data)
+    return extracted_data
 
-        if submit_button:
-            if 'last_url' not in st.session_state or st.session_state['last_url'] != url:
-                st.session_state['last_url'] = url
-                index = sh.initialize_pinecone()
-                # 新しいURLの場合、全データを削除してからスクレイピング
-                sh.delete_all_data_in_namespace(index, "ns1")
-                scraped_data = sh.scrape_url(url)
-                combined_text, metadata_list = sh.prepare_text_and_metadata(sh.extract_keys_from_json(scraped_data))
-                chunks = sh.split_text(combined_text)
-                embeddings = sh.make_chunks_embeddings(chunks)
-                sh.store_data_in_pinecone(index, embeddings, chunks, metadata_list, "ns1")
-                st.success("ウェブサイトを読み込みました！")
+
+# テキストとメタデータを準備
+def prepare_text_and_metadata(combined_data):
+    texts = []
+    metadata_list = []
+
+    for item in combined_data:
+        # テキスト部分の抽出と結合
+        texts.append(item['text'])
+
+        # メタデータの抽出
+        metadata = {
+            "original_url": item.get('url', ''),
+            "description": item.get('description', '') if item.get('description') is not None else '',
+            "title": item.get('title', '') if item.get('title') is not None else '',
+            "keywords": item.get('keywords', '')  # Noneの場合は空文字列を返す
+        }
+        if metadata["keywords"]:  # キーワードが存在する場合のみ分割
+            metadata["keywords"] = metadata["keywords"].split(', ')
+        else:
+            metadata["keywords"] = []  # キーワードがNoneまたは空の場合、空のリストを割り当てる
+
+        metadata_list.append(metadata)
+
+    # すべてのテキストを一つの文字列に結合
+    combined_text = " ".join(texts)
+
+    return combined_text, metadata_list
+
+
+
+
+# テキストをチャンクに
+def split_text(combined_text):
+    set_chunk_length = 1000
+    set_chunk_overlap = 100
+    chunks = RecursiveCharacterTextSplitter(chunk_size = set_chunk_length, chunk_overlap = set_chunk_overlap)
+    return chunks.split_text(combined_text)
+
+from sentence_transformers import SentenceTransformer
+
+def make_chunks_embeddings(chunks):
+    # モデルのロード
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    # 
+    embeddings = model.encode(chunks)
+
+    return embeddings
+
+
+
+### pinecone処理
+def initialize_pinecone():
+    pinecone = Pinecone(api_key=pinecone_api_key)
+    index = pinecone.Index(pinecone_index_name)
+    return index
+
+
+def store_data_in_pinecone(index, chunk_embeddings, chunks, metadata_list, namespace):
+    # 最初のメタデータを使用（共通部分）
+    common_metadata = metadata_list[0]
+
+    vectors_to_upsert = []
+    for i, (embedding, chunk) in enumerate(zip(chunk_embeddings, chunks)):
+        # 一意のIDの生成
+        unique_id = f"{common_metadata['original_url']}-chunk-{i}"
+
+        # メタデータにテキストチャンクを追加
+        metadata = {
+            "original_url": common_metadata['original_url'],
+            "description": common_metadata['description'],
+            "title": common_metadata['title'],
+            "keywords": common_metadata['keywords'],
+            "text_chunk": chunk  # テキストチャンクを追加
+        }
+
+        # ベクトルとメタデータをリストに追加
+        vectors_to_upsert.append({
+            "id": unique_id,
+            "values": embedding.tolist(),  # numpy配列をリストに変換
+            "metadata": metadata
+        })
+
+    # 一度に全てのベクトルをアップロード
+    index.upsert(vectors=vectors_to_upsert, namespace=namespace)
+
+    # 保存したIDをプリント（オプション）
+    for vector in vectors_to_upsert:
+        print(f"Saved: {vector['id']}")
+
+
+
+# クエリの埋め込みベクトルを生成する関数
+def generate_query_embedding(query):
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    return model.encode([query])[0]
+
+# シミラリティ検索を実行する関数
+def perform_similarity_search(index, query, namespace, top_k=4):
+    query_embedding = generate_query_embedding(query)
+    return index.query(
+        namespace=namespace,
+        vector=query_embedding.tolist(),
+        top_k=top_k,
+        include_metadata=True
+    )
+    
+def delete_all_data_in_namespace(index, namespace):
+    index.delete(delete_all=True, namespace=namespace)
+    print(f"次のネームスペースから全データが削除されました： '{namespace}'.")
+
+
+
+def delete_data_by_url(index, namespace, url):
+    # 名前空間内のすべてのIDを取得
+    all_ids = index.describe_index_stats(namespace=namespace)["namespaces"][namespace]["ids"]
+    
+    # 指定されたURLに基づいてIDをフィルタリング
+    ids_to_delete = [id for id in all_ids if url in id]
+    
+    # フィルタリングされたIDを削除
+    index.delete(ids=ids_to_delete, namespace=namespace)
+    print(f"ネームスペース【'{namespace}'】から次のURLの全データ削除されました【'{url}'】.")
+
+
+def extract_text_from_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
+def store_pdf_data_in_pinecone(index, chunk_embeddings, pdf_file_name, namespace):
+    vectors_to_upsert = []
+
+    for i, (embedding, chunk) in enumerate(zip(chunk_embeddings, chunks)):
+        unique_id = f"pdf-chunk-{i}"  # PDFチャンクのIDを設定
+
+        # メタデータにファイル名を使用
+        metadata = {
+            "original_url": pdf_file_name,  # ファイル名をoriginal_urlとして使用
+            "title": pdf_file_name,  # ファイル名をタイトルとして使用
+            "description": "",  # 説明は空
+            "keywords": [],  # キーワードは空のリスト
+            "text_chunk": chunk  # テキストチャンクを追加
+        }
+
+        # ベクトルとメタデータをリストに追加
+        vectors_to_upsert.append({
+            "id": unique_id,
+            "values": embedding.tolist(),
+            "metadata": metadata
+        })
+
+    # 一度に全てのベクトルをアップロード
+    index.upsert(vectors=vectors_to_upsert, namespace=namespace)
+
+    # 保存したIDをプリント（オプション）
+    for vector in vectors_to_upsert:
+        print(f"Saved: {vector['id']}")
+
+
+
+def generate_response_with_llm_for_multiple_namespaces(index, user_input, namespaces):
+    results = {}  # 各名前空間の検索結果を格納する辞書
+
+    # 名前空間ごとに検索結果を取得
+    for ns in namespaces:
+        try:
+            query_embedding = generate_query_embedding(user_input)
+            search_results = index.query(
+                namespace=ns,
+                vector=query_embedding.tolist(),
+                top_k=3,
+                include_metadata=True
+            )
+            if ns == "ns3":
+                # ns3のメタデータを直接利用する特別な処理
+                if search_results['matches']:
+                    metadata = search_results['matches'][0]['metadata']
+                    # 新しいメタデータ形式に基づいて内容を整形してLLMに渡す
+                    results[ns] = "\n".join([f"{key}: {value}" for key, value in metadata.items()])
             else:
-                # URLが同じ場合、データ更新をスキップ
-                st.info("同じウェブサイトのデータを使用")
+                # 他の名前空間の処理は変更なし
+                result_texts = [result['metadata']['text_chunk'] for result in search_results['matches']]
+                results[ns] = " ".join(result_texts) if result_texts else "情報なし"
+        except KeyError as e:
+            print(f"エラーが発生しました: 名前空間 '{ns}' で {e} キーが見つかりません。")
+            results[ns] = "エラー: 検索結果が見つかりませんでした。"
 
-    with col2:
-        if submit_button:
-            with st.spinner('プロットを生成中...'):
-                index = sh.initialize_pinecone()  # initialize_pineconeの呼び出しを繰り返さないように検討する
-                namespaces = ["ns1", "ns2", "ns3", "ns4", "ns5"]
-                response = sh.generate_response_with_llm_for_multiple_namespaces(index, user_input, namespaces)
-                if response:  # responseがNoneでないことを確認
-                    response_text = response.get('text')
-                    st.session_state['response_text'] = response_text  # セッション状態にresponse_textを保存
-                else:
-                    st.session_state['response_text'] = "エラー: プロットを生成できませんでした。"
+    # プロンプトテンプレートの準備
+    prompt_template = PromptTemplate.from_template("""
+    あなたはインスタグラムのフィード投稿用の台本を書くプロです。
+    ユーザーメッセージに従ってインスタグラム用のフィードを作って下さい。
 
-        # セッション状態からresponse_textを取得、存在しない場合はデフォルトのメッセージを表示
-        displayed_value = st.session_state.get('response_text', "生成結果 : プロットが表示されます")
-        st.text_area("生成結果", value=displayed_value, height=400)
-               
+    【台本を作るときの条件】
+    ・投稿をニーズではなくジョブ起点で作って下さい。
+    ・タイトルは簡潔でジョブベースであること。ユーザーが作ってほしい台本のテーマをくれるので、そのまま書くのではなく。そのテーマを細分化していったときの、超具体的なジョブ1つを選んでテーマにし、そのテーマのジョブ(困りごと)起点で書いて下さい。一点に超具体期に刺しにいくイメージです。
+    ・2枚目にはターゲットである読者が共感できそうな、超具体的でな悩み事(ジョブ)を入れてください。そうすることで離脱率が下がります。当たり障りではなく、具体的/主観的でOK。
+    ・投稿内で提示するアクションは超具体的に掘り下げて、一般的なアドバイスにならないようにすること。ある程度ハードルが低いアクションが理想です。ありきたりなアドバイスはつまらないので、とにかく具体度を一段階も二段階も掘り下げましょう。情報が断片的になるのはむしろ掘り下げられている証拠なのでGoodです。独自視点 主観的かつ言い切り表現や評価を全体的に含めて下さい。そうすることであまり見ない具体的なアドバイスになり保存率が上がります。
+    ・とにかく主観で断定・評価すること。一般的な広くて浅い情報はつまらなく、言い切って尖らせたほうがリアルで魅力的です。
+    ・「結局こうすればいいよ」という文脈を必ず含める。特に終盤やまとめでは重要で、あとでこの投稿を見返したくなります。そうすると保存され投稿が伸びます。
+    ・下記の【過去Instagramで投稿された台本】の情報と口調を参照すること。ここにで使われている表現や独自視点を使って下さい。
+    ・下記の【テーマの関連情報】をソースとして使ってください。
+    ・生成する台本のフォーマットは【アウトプット例】と同じフォーマットで生成してください。     
 
+        ----------
+        【ユーザーのメッセージ】
+        {user_input}
+        ----------
+        【テーマの関連情報】
+        {results_ns1}
+        ----------
+        【過去Instagramで投稿された台本】
+        {results_ns3}
+        ----------
+        生成する台本のフォーマットは【アウトプット例】と同じフォーマットで生成してください。
+        ----------
+        【アウトプット例】
+        {example_plot}
+    """)
 
+    # LLMにプロンプトを渡して応答を生成
+    llm = ChatOpenAI(model='gpt-4-1106-preview', temperature=0.71)
+    llm_chain = LLMChain(prompt=prompt_template, llm=llm)
 
+    # st.secretsを使ってプロジェクト名を取得
+    project_name = st.secrets["LANGCHAIN_PROJECT"]
 
-# タブ2: パラメーター設定
-with tab2:
-    st.header('データを登録')
-    # 2カラムを作成
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:  
-        index = sh.initialize_pinecone()
-        st.subheader("URLの登録")
-
-        # URL入力
-        url = st.text_input("登録URLを入力してください")
-
-        # 登録ボタン
-        register_button1 = st.button("URL登録")
-
-        if register_button1:
-            # スクレイピング
-            scraped_data = sh.scrape_url(url)
-
-
-            combined_text, metadata_list = sh.prepare_text_and_metadata(sh.extract_keys_from_json(scraped_data))
-
-
-            chunks = sh.split_text(combined_text)
-
-            embeddings = sh.make_chunks_embeddings(chunks)
-
-            # Pineconeにデータを保存
-            sh.store_data_in_pinecone(index, embeddings, chunks, metadata_list, "ns2")
-
-            st.success("データをPineconeに登録しました！")
-
-        # 全データ削除ボタン
-        delete_all_button1 = st.button("URL全データ削除")
-
-        if delete_all_button1:
-            sh.delete_all_data_in_namespace(index, "ns2")  # 全データを削除する関数を呼び出し
-            st.success("全データが削除されました！")
+    with tracing_v2_enabled(project_name=project_name):
+        response = llm_chain.invoke({
+            "user_input": user_input,
+            "results_ns1": results.get('ns1', '情報なし'),
+            "results_ns2": results.get('ns2', '情報なし'),
+            "results_ns3": results.get('ns3', '情報なし'),
+            "example_plot": example_plot
+        })
+        return response
 
 
-    with col2:
-        index = sh.initialize_pinecone()  # Pineconeを初期化
-        st.subheader("過去プロットの登録")
-
-        # PDFファイルアップロード
-        pdf_file1 = st.file_uploader("PDFファイルをアップロード", type=["pdf"], key="pdf_file1")
-
-        # 登録ボタン
-        register_button2 = st.button("PDF登録")
-
-        if register_button2 and pdf_file1 is not None:
-            # PDFファイルからテキストを抽出
-            pdf_text = sh.extract_text_from_pdf(pdf_file1)
-            
-            # テキストをチャンクに分割
-            chunks = sh.split_text(pdf_text)
-            
-            # チャンクの埋め込みを生成
-            embeddings = sh.make_chunks_embeddings(chunks)
 
 
-            # Pineconeにデータを保存
-            sh.store_pdf_data_in_pinecone(index, embeddings, pdf_file1.name, "ns3")
-            st.success("データをPineconeに登録しました！")
+user_input = "トマトとはを最初に解説して、その後トマトの育て方を詳しく教えてください。 また栄養面からもトマトを育てるメリットを。そして絵文字をたくさんつかってください"
+namespaces = ["ns1", "ns2", "ns3", "ns4"] 
+index = initialize_pinecone()
+response = generate_response_with_llm_for_multiple_namespaces(index, user_input, namespaces)
+print('ひーはー', response)
 
-        # 全データ削除ボタン
-        delete_all_button2 = st.button("全データ削除")
 
-        if delete_all_button2:
-            # 全データを削除する関数を呼び出し
-            sh.delete_all_data_in_namespace(index, "ns3")
-            st.success("全データが削除されました！")
+# ここでinitialize_pinecone関数を呼び出してindexオブジェクトを取得
+index = initialize_pinecone()
 
-    with col3:
-        index = sh.initialize_pinecone()  # Pineconeを初期化
-        st.subheader("競合データの登録")
+# インデックスの状態をチェック
+try:
+    index_stats = index.describe_index_stats()
+    print("インデックスの状態:", index_stats)
+except Exception as e:
+    print("接続エラー:", e)
 
-        # PDFファイルアップロード
-        pdf_file2 = st.file_uploader("PDFファイルをアップロード", type=["pdf"], key="pdf_file2")   
 
-        # 登録ボタン
-        register_button3 = st.button("PDF登録", key="register_button3")
+# テスト用のURLを直接指定
+test_url = "https://www.renoveru.jp/journal/14601"
 
-        if register_button3 and pdf_file2 is not None:
-            # PDFファイルからテキストを抽出
-            pdf_text = sh.extract_text_from_pdf(pdf_file2)
-            
-            # テキストをチャンクに分割
-            chunks = sh.split_text(pdf_text)
-            
-            # チャンクの埋め込みを生成
-            embeddings = sh.make_chunks_embeddings(chunks)
+scraped_data = scrape_url(test_url)
 
-            metadata = sh.create_metadata_for_pdf(pdf_file2.name,chunks)
+# combined_text と metadata_list の準備
+combined_text, metadata_list = prepare_text_and_metadata(extract_keys_from_json(scraped_data))
 
-            # Pineconeにデータを保存
-            sh.store_pdf_data_in_pinecone(index, embeddings, metadata, "ns4")
-            st.success("データをPineconeに登録しました！")
+print(metadata_list)
 
-        # 全データ削除ボタン
-        delete_all_button3 = st.button("全データ削除", key="delete_all_3")
+# テキストをチャンクに分割
+chunks = split_text(combined_text)
 
-        if delete_all_button3:
-            # 全データを削除する関数を呼び出し
-            sh.delete_all_data_in_namespace(index, "ns4")
-            st.success("全データが削除されました！")
 
-    with col4:
-        index = sh.initialize_pinecone()  # Pineconeを初期化
-        st.subheader("SAKIYOMIデータの登録")
+# チャンクの埋め込みを生成
+embeddings = make_chunks_embeddings(chunks)
 
-        # PDFファイルアップロード
-        pdf_file3 = st.file_uploader("PDFをアップロード", type=["pdf"], key="pdf_file3")
+print("エンベディングスの数:", len(embeddings))
 
-        # 登録ボタン
-        register_button4 = st.button("PDF登録", key="register_button4")
+#print("テスト: データをPineconeに保存")
+store_data_in_pinecone(index, embeddings, chunks, metadata_list, "ns1")
 
-        if register_button4 and pdf_file3 is not None:
-            # PDFファイルからテキストを抽出
-            pdf_text = sh.extract_text_from_pdf(pdf_file3)
-            
-            # テキストをチャンクに分割
-            chunks = sh.split_text(pdf_text)
-            
-            # チャンクの埋め込みを生成
-            embeddings = sh.make_chunks_embeddings(chunks)
 
-            metadata = sh.create_metadata_for_pdf(pdf_file3.name,chunks)
+# クエリを実行して結果をプリント
+query = "トマトとはを最初に解説して、その後トマトの育て方を詳しく教えてください。 また栄養面からもトマトを育てるメリットを"
+search_results = perform_similarity_search(index, query, "ns1" , top_k=1)
+print(search_results)
 
-            # Pineconeにデータを保存
-            sh.store_pdf_data_in_pinecone(index, embeddings, metadata, "ns5")
-            st.success("データをPineconeに登録しました！")
-
-        # 全データ削除ボタン
-        delete_all_button4 = st.button("全データ削除", key="delete_all_4")
-
-        if delete_all_button4:
-            # 全データを削除する関数を呼び出し
-            sh.delete_all_data_in_namespace(index, "ns5")
-            st.success("全データが削除されました！")
+delete_all_data_in_namespace(index, "ns1")
